@@ -674,6 +674,144 @@ def test_chain_points_to_revisit_without_refers_to():
     assert d["chain"] == ["<urn:uuid:v1>", "<urn:uuid:v2>"]
 
 
+# ---------- 终点索引：显式栈遍历、每节点每包至多展开一次 ----------
+
+
+def _revisit(rid, target, *, uri="http://example.com/"):
+    return raw_record(
+        rid, rec_type="revisit", block=b"", uri=uri,
+        extra_headers=f"WARC-Refers-To: {target}\r\n".encode())
+
+
+def test_deep_revisit_chain_resolves_without_recursion_depth():
+    # 5000 级前向引用链 -> 终点 response：显式栈迭代展开，不受递归深度限制
+    n = 5000
+    blob = b"".join(
+        _revisit(f"<urn:uuid:r{i}>", f"<urn:uuid:r{i + 1}>")
+        for i in range(n)
+    )
+    blob += raw_record(
+        f"<urn:uuid:r{n}>", rec_type="response",
+        block=http_block(body=b"deep-end"))
+    r = post(blob)
+    assert r.status_code == 200, r.text
+    records = r.json()["records"]
+    assert len(records) == n + 1
+    assert all(rec["body_source_id"] == f"<urn:uuid:r{n}>" for rec in records)
+    assert base64.b64decode(records[0]["body_base64"]) == b"deep-end"
+
+
+def test_deep_revisit_cycle_reports_full_chain():
+    # 2000 级链后回指链首：成环检测同样不依赖递归，chain 原样闭合
+    n = 2000
+    blob = b"".join(
+        _revisit(f"<urn:uuid:c{i}>", f"<urn:uuid:c{i + 1}>")
+        for i in range(n)
+    )
+    blob += _revisit(f"<urn:uuid:c{n}>", "<urn:uuid:c0>")
+    r = post(blob)
+    assert r.status_code == 422
+    d = r.json()
+    assert d["error"] == "reference_cycle"
+    assert d["record_id"] == "<urn:uuid:c0>"
+    assert d["chain"][0] == "<urn:uuid:c0>"
+    assert d["chain"][-1] == "<urn:uuid:c0>"
+    assert len(d["chain"]) == n + 2
+
+
+def test_endpoint_index_caches_shared_subgraph():
+    # a -> c, b -> c, c -> d, d -> e（response）：c/d 只展开一次，
+    # 每条 revisit 都缓存到同一终点 e
+    blob = (
+        _revisit("<urn:uuid:a>", "<urn:uuid:c>", uri="http://a/")
+        + _revisit("<urn:uuid:b>", "<urn:uuid:c>", uri="http://b/")
+        + _revisit("<urn:uuid:c>", "<urn:uuid:d>")
+        + _revisit("<urn:uuid:d>", "<urn:uuid:e>")
+        + raw_record("<urn:uuid:e>", rec_type="response",
+                     block=http_block(body=b"shared-end"))
+    )
+    r = post(blob)
+    assert r.status_code == 200, r.text
+    records = r.json()["records"]
+    assert all(rec["body_source_id"] == "<urn:uuid:e>" for rec in records)
+    assert base64.b64decode(records[0]["body_base64"]) == b"shared-end"
+
+    from app.replay import parse_warc, validate_records
+    raws = parse_warc(blob)
+    index = validate_records(raws)
+    revisits = {raw.record_id for raw in raws if raw.rec_type == "revisit"}
+    # 每条 revisit 的终点都已缓存，且全部指向同一终点 response
+    assert set(index._endpoints) == revisits
+    assert all(
+        index.endpoint_for(raw).record_id_raw == "<urn:uuid:e>"
+        for raw in raws if raw.rec_type == "revisit"
+    )
+    # 重复查询命中缓存，不再走链
+    assert index.endpoint_for(raws[0]).record_id_raw == "<urn:uuid:e>"
+
+
+def test_first_error_record_with_shared_chain_prefix():
+    # a -> mid -> end（无 HTTP 头），b -> mid：a 在归档原序上先校验，
+    # 缓存共享不改变首个报错记录与 chain 归因
+    blob = (
+        _revisit("<urn:uuid:a>", "<urn:uuid:mid>")
+        + _revisit("<urn:uuid:b>", "<urn:uuid:mid>")
+        + _revisit("<urn:uuid:mid>", "<urn:uuid:end>")
+        + raw_record("<urn:uuid:end>", rec_type="response", block=b"")
+    )
+    r = post(blob)
+    assert r.status_code == 422
+    d = r.json()
+    assert d["error"] == "endpoint_without_http_headers"
+    assert d["record_id"] == "<urn:uuid:a>"
+    assert d["chain"] == [
+        "<urn:uuid:a>", "<urn:uuid:mid>", "<urn:uuid:end>"]
+
+
+def test_second_root_own_chain_error_attributed_to_that_root():
+    # a -> mid -> good（合法，mid 在 a 的遍历中被缓存）；其后 b 的链
+    # b -> midb -> ghost 独立失败：首个错误归因于 b（a/mid 已缓存且合法，
+    # 不影响 b 的错误 record_id 与 chain）
+    blob = (
+        _revisit("<urn:uuid:a>", "<urn:uuid:mid>")
+        + _revisit("<urn:uuid:b>", "<urn:uuid:midb>")
+        + _revisit("<urn:uuid:mid>", "<urn:uuid:good>")
+        + _revisit("<urn:uuid:midb>", "<urn:uuid:ghost>")
+        + raw_record("<urn:uuid:good>", rec_type="response",
+                     block=http_block(body=b"ok"))
+    )
+    r = post(blob)
+    assert r.status_code == 422
+    d = r.json()
+    assert d["error"] == "target_not_found"
+    assert d["record_id"] == "<urn:uuid:b>"
+    assert d["missing_id"] == "<urn:uuid:ghost>"
+    assert d["chain"] == [
+        "<urn:uuid:b>", "<urn:uuid:midb>", "<urn:uuid:ghost>"]
+
+
+def test_endpoint_index_is_independent_per_archive():
+    # 两份归档含相同 ID：各自建立独立终点索引，互不串台
+    from app.replay import parse_warc, validate_records
+    w1 = (
+        _revisit("<urn:uuid:v>", "<urn:uuid:e>")
+        + raw_record("<urn:uuid:e>", rec_type="response",
+                     block=http_block(body=b"one"))
+    )
+    w2 = (
+        _revisit("<urn:uuid:v>", "<urn:uuid:e>")
+        + raw_record("<urn:uuid:e>", rec_type="response",
+                     block=http_block(body=b"two"))
+    )
+    raws1 = parse_warc(w1)
+    raws2 = parse_warc(w2)
+    index1 = validate_records(raws1)
+    index2 = validate_records(raws2)
+    assert index1.endpoint_for(raws1[0]).body == b"one"
+    assert index2.endpoint_for(raws2[0]).body == b"two"
+    assert index1.endpoint_for(raws1[0]) is not index2.endpoint_for(raws2[0])
+
+
 def test_body_preserved_raw_despite_content_encoding():
     # 正文按归档存储的原始字节返回，不解 Content-Encoding
     import gzip as _gzip

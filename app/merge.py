@@ -240,11 +240,13 @@ def merge(left_warc_b64: str, right_warc_b64: str) -> dict:
     # 先左后右：各自完整解码 + 结构/引用链校验，任一包有错即 422
     left_data = decode_warc_payload(left_warc_b64)
     left_raws = parse_warc(left_data, capture_spans=True)
-    left_by_id = validate_records(left_raws)
+    left_index = validate_records(left_raws)
+    left_by_id = left_index.by_id
 
     right_data = decode_warc_payload(right_warc_b64)
     right_raws = parse_warc(right_data, capture_spans=True)
-    right_by_id = validate_records(right_raws)
+    right_index = validate_records(right_raws)
+    right_by_id = right_index.by_id
 
     # 跨包冲突（按规范化 ID 比较）：只为右包冲突记录生成确定性新 ID
     used = set(left_by_id) | set(right_by_id)
@@ -320,7 +322,7 @@ def _validate_merged(merged: bytes, left_raws: list[_RawRecord],
 
     try:
         merged_raws = parse_warc(merged, capture_spans=True)
-        merged_by_id = validate_records(merged_raws)
+        merged_index = validate_records(merged_raws)
     except ReplayError as exc:
         extra = {k: v for k, v in exc.detail.items()
                  if k not in ("error", "message")}
@@ -333,7 +335,7 @@ def _validate_merged(merged: bytes, left_raws: list[_RawRecord],
         )
 
     actual_order = [raw.record_id for raw in merged_raws]
-    if actual_order != expected_order or set(merged_by_id) != expected_ids:
+    if actual_order != expected_order or set(merged_index.by_id) != expected_ids:
         raise ReplayError(
             "invalid_merged_warc",
             "合并生成的 WARC 记录数、顺序或记录 ID 与合并预期不一致，"
@@ -341,5 +343,5 @@ def _validate_merged(merged: bytes, left_raws: list[_RawRecord],
             expected_count=len(expected_order),
             actual_count=len(actual_order),
             expected_ids=sorted(expected_ids),
-            actual_ids=sorted(merged_by_id),
+            actual_ids=sorted(merged_index.by_id),
         )

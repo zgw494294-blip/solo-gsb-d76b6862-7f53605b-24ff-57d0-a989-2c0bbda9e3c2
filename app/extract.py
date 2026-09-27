@@ -71,7 +71,8 @@ def extract(warc_b64: str, record_ids: list[str]) -> dict:
     """extract 入口：返回 included_ids 与导出包 Base64；错误抛 ReplayError。"""
     data = decode_warc_payload(warc_b64)
     raws = parse_warc(data, capture_spans=True)
-    by_id = validate_records(raws)
+    index = validate_records(raws)
+    by_id = index.by_id
 
     # 规范化请求 ID，按请求顺序去重；任一未知 ID 立即 422
     requested: list[str] = []

@@ -28,7 +28,6 @@ from typing import Optional
 from .replay import (
     ReplayError,
     _RawRecord,
-    _validate_chain,
     decode_warc_payload,
     parse_warc,
     validate_records,
@@ -128,16 +127,15 @@ def digest_audit(warc_b64: str) -> dict:
     """digest-audit 入口：按归档原序返回每条记录的核验结果与失配总数。"""
     data = decode_warc_payload(warc_b64)
     raws = parse_warc(data, capture_spans=True)
-    by_id = validate_records(raws)
+    index = validate_records(raws)
 
     records: list[dict] = []
     mismatch_count = 0
     for raw in raws:
         if raw.rec_type == "revisit":
-            # Payload 摘要用引用链终点 response 的正文；链有效性已由
-            # validate_records 保证，这里沿链必达终点。
-            _, endpoint = _validate_chain(raw, by_id)
-            payload = endpoint.body
+            # Payload 摘要用引用链终点 response 的正文；终点已在索引
+            # 构建期解析并缓存，这里直接命中，不再走链。
+            payload = index.endpoint_for(raw).body
         else:
             payload = raw.body
 
