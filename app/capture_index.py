@@ -35,11 +35,10 @@ from typing import Optional
 from .navigate import _parse_rfc3339
 from .replay import (
     ReplayError,
+    _ArchiveIndex,
     _RawRecord,
-    _validate_chain,
     decode_warc_payload,
     parse_warc,
-    validate_records,
 )
 
 # cursor 格式版本：结构变更时递增，旧版本 cursor 一律判无效
@@ -160,7 +159,7 @@ def capture_index(warc_b64: str, page_size: int,
     # 缺 WARC-Target-URI 的记录只是不参与列出，不应让整包判畸形；
     # capture_spans 记录每条记录在解压后归档中的字节范围
     raws = parse_warc(data, allow_missing_target_uri=True, capture_spans=True)
-    by_id = validate_records(raws)
+    index = _ArchiveIndex(raws)
 
     entries: list[_Entry] = []
     for raw in raws:
@@ -170,8 +169,8 @@ def capture_index(warc_b64: str, page_size: int,
             continue  # 缺 URL 或日期的记录跳过（不影响其余记录）
         moment = _parse_capture_date(raw)
         if raw.rec_type == "revisit":
-            # 链有效性已由 validate_records 保证，沿链必达终点 response
-            _, endpoint = _validate_chain(raw, by_id)
+            # 链有效性已由 _ArchiveIndex 保证并缓存，直接取终点 response
+            endpoint = index.endpoint_for(raw)
             body_source_id = endpoint.record_id_raw
         else:
             body_source_id = raw.record_id_raw

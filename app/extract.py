@@ -26,10 +26,9 @@ import base64
 
 from .replay import (
     ReplayError,
-    _RawRecord,
+    _ArchiveIndex,
     decode_warc_payload,
     parse_warc,
-    validate_records,
 )
 
 # WARC 记录分隔符：CRLF CRLF
@@ -49,21 +48,21 @@ def _normalize_requested_id(raw: str) -> str:
     return value
 
 
-def _closure(requested: list[str], by_id: dict[str, _RawRecord]) -> set[str]:
+def _closure(requested: list[str], index: _ArchiveIndex) -> set[str]:
     """所请记录 + 其 revisit 引用链传递依赖（规范化 ID 集合）。
 
     链的有效性（每跳目标存在、无环、终点为 response）已由
-    :func:`app.replay.validate_records` 对全包保证，这里沿链必达终点，
+    :class:`app.replay._ArchiveIndex` 对全包保证，这里沿链必达终点，
     不会失败、不会死循环。
     """
     included: set[str] = set()
     for norm in requested:
-        current = by_id[norm]
+        current = index.by_id[norm]
         while current.record_id not in included:
             included.add(current.record_id)
             if current.rec_type != "revisit":
                 break
-            current = by_id[current.refers_to]  # type: ignore[index]
+            current = index.by_id[current.refers_to]  # type: ignore[index]
     return included
 
 
@@ -71,7 +70,7 @@ def extract(warc_b64: str, record_ids: list[str]) -> dict:
     """extract 入口：返回 included_ids 与导出包 Base64；错误抛 ReplayError。"""
     data = decode_warc_payload(warc_b64)
     raws = parse_warc(data, capture_spans=True)
-    by_id = validate_records(raws)
+    index = _ArchiveIndex(raws)
 
     # 规范化请求 ID，按请求顺序去重；任一未知 ID 立即 422
     requested: list[str] = []
@@ -81,7 +80,7 @@ def extract(warc_b64: str, record_ids: list[str]) -> dict:
         if norm in seen:
             continue
         seen.add(norm)
-        if norm not in by_id:
+        if norm not in index.by_id:
             raise ReplayError(
                 "unknown_record_id",
                 f"记录 ID {raw_id!r} 在归档的 response/revisit 记录中不存在",
@@ -89,7 +88,7 @@ def extract(warc_b64: str, record_ids: list[str]) -> dict:
             )
         requested.append(norm)
 
-    included = _closure(requested, by_id)
+    included = _closure(requested, index)
 
     # 按归档原序切出原始字节；included_ids 与写出顺序一致
     chunks: list[bytes] = []

@@ -615,112 +615,160 @@ def parse_warc(data: bytes, *, allow_missing_target_uri: bool = False,
     return records
 
 
-def _validate_chain(raw: _RawRecord, by_id: dict[str, _RawRecord]) -> tuple[list[str], _RawRecord]:
-    """沿 WARC-Refers-To 走链。
+class _ArchiveIndex:
+    """单份归档专属的记录索引与 revisit 终点解析器。
 
-    返回 ``(引用链, 终点记录)``。引用链包含 revisit 自身及每一跳的
-    原始 ID 字面值；引用缺失时最后一个元素为缺失的目标字面值。
+    每份归档各自建立一个实例：``by_id`` 为规范化 ``WARC-Record-ID`` 到记录
+    的索引，``_endpoints`` 缓存每条已解析 revisit（以及已校验 response）
+    对应的终点 response。
+
+    建立过程严格按归档原序：先做全包重复 ID 检查，再逐条记录校验——
+    response 校验自身 HTTP 响应头，revisit 用**显式栈**（不依赖递归深度）
+    遍历 ``WARC-Refers-To`` 引用：
+
+    - 合法引用链的每个节点在一包内至多展开一次——走链途中命中已缓存的
+      节点即直接复用其终点，整条中间链也一并缓存；
+    - 前向引用、多级引用、空正文照常支持；
+    - 断链（``chain_broken``）、目标缺失（``target_not_found``）、成环
+      （``reference_cycle``）、终点非 response（``invalid_target_type``）、
+      终点无 HTTP 响应头（``endpoint_without_http_headers``）均保留原有
+      错误码、首个报错记录与原样 chain。
+
+    :func:`load_records` 与依赖引用链的各接口（extract / merge /
+    member-pack / digest-audit / capture-index / http-exchanges）共用同一
+    个索引，保证对同一归档的判定与终点正文完全一致。
     """
-    chain = [raw.record_id_raw]
-    current = raw
-    seen: set[str] = set()
 
-    while current.rec_type == "revisit":
-        if current.record_id in seen:
-            # chain 已追加过指回当前节点的那条边（current 的 ID 已在
-            # chain 末尾），直接在重复节点处闭合引用链，不再重复追加。
-            raise ReplayError(
-                "reference_cycle",
-                f"记录 {raw.record_id_raw} 的 WARC-Refers-To 引用链成环",
-                record_id=raw.record_id_raw,
-                chain=chain,
-            )
-        seen.add(current.record_id)
+    def __init__(self, raws: list[_RawRecord]):
+        self.raws = raws
+        self.by_id: dict[str, _RawRecord] = {}
+        self._endpoints: dict[str, _RawRecord] = {}
+        self._build()
 
-        if not current.refers_to:
-            raise ReplayError(
-                "chain_broken",
-                f"revisit 记录 {current.record_id_raw} 缺少 WARC-Refers-To，"
-                "无法定位引用目标",
-                record_id=raw.record_id_raw,
-                broken_record_id=current.record_id_raw,
-                chain=chain,
-            )
-
-        target = by_id.get(current.refers_to)
-        if target is None:
-            chain.append(current.refers_to_raw)  # type: ignore[arg-type]
-            raise ReplayError(
-                "target_not_found",
-                f"记录 {current.record_id_raw} 通过 WARC-Refers-To 引用的 "
-                f"{current.refers_to_raw} 在包内不存在",
-                record_id=raw.record_id_raw,
-                missing_id=current.refers_to_raw,
-                chain=chain,
-            )
-
-        chain.append(current.refers_to_raw)  # type: ignore[arg-type]
-        current = target
-
-    # 链终点不是 response（理论上 response/revisit 之外的类型已被过滤，
-    # 这里仍做防御性处理）。
-    if current.rec_type != "response":
-        raise ReplayError(
-            "invalid_target_type",
-            f"记录 {raw.record_id_raw} 的引用链终点类型为 {current.rec_type}，"
-            "终点必须为 response",
-            record_id=raw.record_id_raw,
-            chain=chain,
-            endpoint_record_id=current.record_id_raw,
-            endpoint_record_type=current.rec_type,
-        )
-
-    if current.http_status is None:
-        raise ReplayError(
-            "endpoint_without_http_headers",
-            f"记录 {raw.record_id_raw} 的引用链终点 {current.record_id_raw} "
-            "不是有效的 HTTP 响应（缺少 HTTP 响应头或状态行）",
-            record_id=raw.record_id_raw,
-            chain=chain,
-            endpoint_record_id=current.record_id_raw,
-        )
-
-    return chain, current
-
-
-def validate_records(raws: list[_RawRecord]) -> dict[str, _RawRecord]:
-    """按 WARC-Record-ID 建索引并完成全部结构校验。
-
-    检查包内重复 ID、response 记录自身的 HTTP 响应头、revisit 的
-    WARC-Refers-To 引用链（断链/缺失目标/成环/终点类型与终点 HTTP 头）。
-    返回规范化 ID -> 记录的索引。:func:`load_records` 与 /v1/extract
-    共用这一套校验，保证各接口对同一归档的判定完全一致。
-    """
-    by_id: dict[str, _RawRecord] = {}
-    for raw in raws:
-        if raw.record_id in by_id:
-            raise ReplayError(
-                "duplicate_record_id",
-                f"WARC-Record-ID {raw.record_id_raw} 在包内重复出现",
-                record_id=raw.record_id_raw,
-                first_record_order=by_id[raw.record_id].order,
-                duplicate_record_order=raw.order,
-            )
-        by_id[raw.record_id] = raw
-
-    for raw in raws:
-        if raw.rec_type == "response":
-            if raw.http_status is None:
+    def _build(self) -> None:
+        """先检查重复 ID，再按归档原序逐条完成校验与终点缓存。"""
+        for raw in self.raws:
+            if raw.record_id in self.by_id:
                 raise ReplayError(
-                    "response_without_http_headers",
-                    f"response 记录 {raw.record_id_raw} 缺少有效的 HTTP 响应头"
-                    "或状态行",
+                    "duplicate_record_id",
+                    f"WARC-Record-ID {raw.record_id_raw} 在包内重复出现",
                     record_id=raw.record_id_raw,
-                    record_order=raw.order,
+                    first_record_order=self.by_id[raw.record_id].order,
+                    duplicate_record_order=raw.order,
                 )
-        else:
-            _validate_chain(raw, by_id)
-    return by_id
+            self.by_id[raw.record_id] = raw
+
+        for raw in self.raws:
+            if raw.rec_type == "response":
+                if raw.http_status is None:
+                    raise ReplayError(
+                        "response_without_http_headers",
+                        f"response 记录 {raw.record_id_raw} 缺少有效的 HTTP 响应头"
+                        "或状态行",
+                        record_id=raw.record_id_raw,
+                        record_order=raw.order,
+                    )
+                self._endpoints[raw.record_id] = raw
+            else:
+                self._walk_to_endpoint(raw)
+
+    def _walk_to_endpoint(self, start: _RawRecord) -> _RawRecord:
+        """用显式栈把 ``start`` 的引用链遍历到终点 response。
+
+        栈中保存路径上的 revisit 节点（不重复入栈），``chain`` 保存与旧
+        递归口径完全一致的引用链（起点自身 + 每跳 ``WARC-Refers-To``
+        原始字面值），仅供报错时原样返回。到达合法终点后，栈上每条
+        revisit 都缓存到同一终点；命中已有缓存则直接短路返回。
+        """
+        chain = [start.record_id_raw]
+        path: set[str] = set()
+        stack: list[_RawRecord] = []
+        current = start
+
+        while True:
+            cached = self._endpoints.get(current.record_id)
+            if cached is not None:
+                for node in stack:
+                    self._endpoints[node.record_id] = cached
+                return cached
+
+            if current.record_id in path:
+                # chain 已追加过指回当前节点的那条边（current 的 ID 已在
+                # chain 末尾），直接在重复节点处闭合引用链，不再重复追加。
+                raise ReplayError(
+                    "reference_cycle",
+                    f"记录 {start.record_id_raw} 的 WARC-Refers-To 引用链成环",
+                    record_id=start.record_id_raw,
+                    chain=chain,
+                )
+
+            if current.rec_type != "revisit":
+                # 链终点不是 response（理论上 response/revisit 之外的类型已
+                # 被过滤，这里仍做防御性处理）。
+                raise ReplayError(
+                    "invalid_target_type",
+                    f"记录 {start.record_id_raw} 的引用链终点类型为 "
+                    f"{current.rec_type}，终点必须为 response",
+                    record_id=start.record_id_raw,
+                    chain=chain,
+                    endpoint_record_id=current.record_id_raw,
+                    endpoint_record_type=current.rec_type,
+                )
+
+            path.add(current.record_id)
+            stack.append(current)
+
+            if not current.refers_to:
+                raise ReplayError(
+                    "chain_broken",
+                    f"revisit 记录 {current.record_id_raw} 缺少 WARC-Refers-To，"
+                    "无法定位引用目标",
+                    record_id=start.record_id_raw,
+                    broken_record_id=current.record_id_raw,
+                    chain=chain,
+                )
+
+            target = self.by_id.get(current.refers_to)
+            if target is None:
+                chain.append(current.refers_to_raw)  # type: ignore[arg-type]
+                raise ReplayError(
+                    "target_not_found",
+                    f"记录 {current.record_id_raw} 通过 WARC-Refers-To 引用的 "
+                    f"{current.refers_to_raw} 在包内不存在",
+                    record_id=start.record_id_raw,
+                    missing_id=current.refers_to_raw,
+                    chain=chain,
+                )
+
+            chain.append(current.refers_to_raw)  # type: ignore[arg-type]
+            current = target
+
+            if current.rec_type == "response":
+                if current.http_status is None:
+                    raise ReplayError(
+                        "endpoint_without_http_headers",
+                        f"记录 {start.record_id_raw} 的引用链终点 "
+                        f"{current.record_id_raw} 不是有效的 HTTP 响应"
+                        "（缺少 HTTP 响应头或状态行）",
+                        record_id=start.record_id_raw,
+                        chain=chain,
+                        endpoint_record_id=current.record_id_raw,
+                    )
+                for node in stack:
+                    self._endpoints[node.record_id] = current
+                return current
+
+    def endpoint_for(self, raw: _RawRecord) -> _RawRecord:
+        """返回记录还原后正文所属的终点 response。
+
+        response 为自身；revisit 为其引用链终点。索引建立阶段所有链均已
+        校验并缓存，这里正常情况下直接命中，``_walk_to_endpoint`` 仅作
+        防御性兜底。
+        """
+        endpoint = self._endpoints.get(raw.record_id)
+        if endpoint is None:
+            endpoint = self._walk_to_endpoint(raw)
+        return endpoint
 
 
 def load_records(warc_b64: str, *, allow_missing_target_uri: bool = False
@@ -737,16 +785,13 @@ def load_records(warc_b64: str, *, allow_missing_target_uri: bool = False
     """
     data = decode_warc_payload(warc_b64)
     raws = parse_warc(data, allow_missing_target_uri=allow_missing_target_uri)
-    by_id = validate_records(raws)
+    index = _ArchiveIndex(raws)
 
     resolved: list[ResolvedRecord] = []
     for raw in raws:
-        if raw.rec_type == "response":
-            endpoint = raw
-        else:
-            # revisit：保留自己的 URL/时间/状态/Location，正文只继承链终点
-            # response，不借用终点的状态或 Location。
-            _, endpoint = _validate_chain(raw, by_id)
+        # revisit：保留自己的 URL/时间/状态/Location，正文只继承链终点
+        # response（已由索引缓存），不借用终点的状态或 Location。
+        endpoint = index.endpoint_for(raw)
 
         resolved.append(
             ResolvedRecord(

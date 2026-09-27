@@ -46,10 +46,10 @@ from typing import Optional
 from .replay import (
     MAX_DECODED_BYTES,
     ReplayError,
+    _ArchiveIndex,
     _RawRecord,
     decode_warc_payload,
     parse_warc,
-    validate_records,
 )
 
 # WARC 记录分隔符：CRLF CRLF
@@ -237,14 +237,15 @@ def _new_record_id(old_norm: str, used: set[str]) -> str:
 
 def merge(left_warc_b64: str, right_warc_b64: str) -> dict:
     """merge 入口：返回 count / merged_warc / renamed；错误抛 ReplayError。"""
-    # 先左后右：各自完整解码 + 结构/引用链校验，任一包有错即 422
+    # 先左后右：各自完整解码 + 结构/引用链校验，任一包有错即 422；
+    # _ArchiveIndex 构造即完成全部校验
     left_data = decode_warc_payload(left_warc_b64)
     left_raws = parse_warc(left_data, capture_spans=True)
-    left_by_id = validate_records(left_raws)
+    left_by_id = _ArchiveIndex(left_raws).by_id
 
     right_data = decode_warc_payload(right_warc_b64)
     right_raws = parse_warc(right_data, capture_spans=True)
-    right_by_id = validate_records(right_raws)
+    right_by_id = _ArchiveIndex(right_raws).by_id
 
     # 跨包冲突（按规范化 ID 比较）：只为右包冲突记录生成确定性新 ID
     used = set(left_by_id) | set(right_by_id)
@@ -310,7 +311,7 @@ def _validate_merged(merged: bytes, left_raws: list[_RawRecord],
 
     改名（尤其带续行的头）或拼接理论上都应保持归档可回放；这里以实际解析
     结果兜底：记录数、记录顺序、规范化 ID 集合与预期逐一核对，引用链交给
-    :func:`validate_records` 验证。任一项不符就返回 422，绝不交付 200 +
+    :class:`_ArchiveIndex` 验证。任一项不符就返回 422，绝不交付 200 +
     无法回放的 merged_warc。
     """
     expected_order = [raw.record_id for raw in left_raws]
@@ -320,7 +321,7 @@ def _validate_merged(merged: bytes, left_raws: list[_RawRecord],
 
     try:
         merged_raws = parse_warc(merged, capture_spans=True)
-        merged_by_id = validate_records(merged_raws)
+        merged_by_id = _ArchiveIndex(merged_raws).by_id
     except ReplayError as exc:
         extra = {k: v for k, v in exc.detail.items()
                  if k not in ("error", "message")}

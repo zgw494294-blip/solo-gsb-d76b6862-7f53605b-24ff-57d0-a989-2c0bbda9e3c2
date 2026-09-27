@@ -29,10 +29,10 @@ from __future__ import annotations
 
 from .replay import (
     ReplayError,
+    _ArchiveIndex,
     _RawRecord,
     decode_warc_payload,
     parse_warc,
-    validate_records,
 )
 
 # 交换的“响应侧”类型
@@ -68,7 +68,8 @@ def http_exchanges(warc_b64: str) -> dict:
         by_id[raw.record_id] = raw
 
     # 2) response/revisit 沿用现有全部校验：HTTP 响应头、revisit 引用链
-    validate_records([raw for raw in raws if raw.rec_type in _RESPONSE_TYPES])
+    #    （每包独立索引，显式栈遍历并缓存各 revisit 的终点 response）
+    _ArchiveIndex([raw for raw in raws if raw.rec_type in _RESPONSE_TYPES])
 
     # 3) request 记录必须是合法 HTTP 请求（与 response_without_http_headers
     #    对应），否则无法给出请求方法与请求目标

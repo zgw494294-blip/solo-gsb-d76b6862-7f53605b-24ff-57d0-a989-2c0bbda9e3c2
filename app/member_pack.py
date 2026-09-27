@@ -45,11 +45,10 @@ from .merge import (
 from .replay import (
     MAX_DECODED_BYTES,
     ReplayError,
-    _validate_chain,
+    _ArchiveIndex,
     decode_warc_payload,
     gunzip_if_needed,
     parse_warc,
-    validate_records,
 )
 
 # WARC 记录分隔符：CRLF CRLF（每个 gzip member 的记录块之后附带一个，
@@ -98,12 +97,9 @@ def _final_record_member_payload(chunk: bytes) -> bytes:
     return chunk + _RECORD_SEPARATOR
 
 
-def _replay_view(raw, by_id):
+def _replay_view(raw, index: _ArchiveIndex):
     """与 /v1/replay 一致的 (record_id 原值, 状态, 正文, 正文来源 ID)。"""
-    if raw.rec_type == "revisit":
-        _, endpoint = _validate_chain(raw, by_id)
-    else:
-        endpoint = raw
+    endpoint = index.endpoint_for(raw)
     return (
         raw.record_id_raw,
         raw.http_status,
@@ -120,8 +116,8 @@ def _validate_packed(packed: bytes, expected) -> None:
     """
     try:
         packed_raws = parse_warc(packed)
-        packed_by_id = validate_records(packed_raws)
-        actual = [_replay_view(raw, packed_by_id) for raw in packed_raws]
+        packed_index = _ArchiveIndex(packed_raws)
+        actual = [_replay_view(raw, packed_index) for raw in packed_raws]
     except ReplayError as exc:
         extra = {k: v for k, v in exc.detail.items()
                  if k not in ("error", "message")}
@@ -149,8 +145,8 @@ def member_pack(warc_b64: str) -> dict:
     """
     data = decode_warc_payload(warc_b64)
     raws = parse_warc(data, capture_spans=True)
-    by_id = validate_records(raws)
-    expected = [_replay_view(raw, by_id) for raw in raws]
+    index = _ArchiveIndex(raws)
+    expected = [_replay_view(raw, index) for raw in raws]
 
     # 按归档原序逐记录构造 member 负载：普通记录 = span 原字节 + 分隔符；
     # 末记录缺 Content-Length（块延伸至 EOF）时补入准确块长后再追加分隔符
